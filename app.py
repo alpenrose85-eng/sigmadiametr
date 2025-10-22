@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import io
 import warnings
 warnings.filterwarnings('ignore')
@@ -30,18 +28,45 @@ class SigmaPhaseModel:
         self.mae = None
         
     def fit(self, X, y):
-        model = LinearRegression()
-        model.fit(X, y)
-        self.coef_ = model.coef_
-        self.intercept_ = model.intercept_
+        """Линейная регрессия с использованием метода наименьших квадратов"""
+        # Добавляем столбец для intercept
+        X_with_intercept = np.column_stack([np.ones(X.shape[0]), X])
         
-        # Расчет метрик
-        y_pred = model.predict(X)
-        self.r2 = r2_score(y, y_pred)
-        self.rmse = np.sqrt(mean_squared_error(y, y_pred))
-        self.mae = mean_absolute_error(y, y_pred)
+        # Решаем нормальное уравнение: (X^T X)^{-1} X^T y
+        try:
+            coefficients = np.linalg.inv(X_with_intercept.T @ X_with_intercept) @ X_with_intercept.T @ y
+            self.intercept_ = coefficients[0]
+            self.coef_ = coefficients[1:]
+            
+            # Расчет метрик
+            y_pred = self.predict_ln_d(X)
+            self.r2 = self.calculate_r2(y, y_pred)
+            self.rmse = self.calculate_rmse(y, y_pred)
+            self.mae = self.calculate_mae(y, y_pred)
+            
+        except np.linalg.LinAlgError:
+            st.error("Ошибка: матрица вырождена. Проверьте данные на мультиколлинеарность.")
+            return None
         
         return self
+    
+    def predict_ln_d(self, X):
+        """Предсказание ln(d)"""
+        return self.intercept_ + X @ self.coef_
+    
+    def calculate_r2(self, y_true, y_pred):
+        """Расчет коэффициента детерминации R²"""
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+        return 1 - (ss_res / ss_tot)
+    
+    def calculate_rmse(self, y_true, y_pred):
+        """Расчет RMSE"""
+        return np.sqrt(np.mean((y_true - y_pred) ** 2))
+    
+    def calculate_mae(self, y_true, y_pred):
+        """Расчет MAE"""
+        return np.mean(np.abs(y_true - y_pred))
     
     def predict_temperature(self, d_sigma, time_hours, grain_size):
         """Предсказание температуры по модели"""
@@ -95,7 +120,8 @@ def create_validation_charts(df_clean, y, y_pred):
         'predicted': np.exp(y_pred),
         'residuals': np.exp(y) - np.exp(y_pred),
         'temperature': df_clean['T'],
-        'grain_size': df_clean['G']
+        'grain_size': df_clean['G'],
+        'time': df_clean['t']
     })
     
     # График 1: Предсказанные vs Фактические значения
@@ -103,19 +129,24 @@ def create_validation_charts(df_clean, y, y_pred):
         x=alt.X('actual:Q', title='Фактический диаметр (мкм²)'),
         y=alt.Y('predicted:Q', title='Предсказанный диаметр (мкм²)'),
         color='temperature:Q',
-        tooltip=['actual', 'predicted', 'temperature', 'grain_size']
+        tooltip=['actual', 'predicted', 'temperature', 'grain_size', 'time']
     ).properties(
         width=400,
         height=300,
         title='Предсказанные vs Фактические значения'
     )
     
-    line = alt.Chart(pd.DataFrame({
-        'actual': [plot_data['actual'].min(), plot_data['actual'].max()],
-        'predicted': [plot_data['actual'].min(), plot_data['actual'].max()]
-    })).mark_line(color='red', strokeDash=[5,5]).encode(
-        x='actual:Q',
-        y='predicted:Q'
+    # Линия идеального предсказания
+    min_val = plot_data[['actual', 'predicted']].min().min()
+    max_val = plot_data[['actual', 'predicted']].max().max()
+    line_data = pd.DataFrame({
+        'x': [min_val, max_val],
+        'y': [min_val, max_val]
+    })
+    
+    line = alt.Chart(line_data).mark_line(color='red', strokeDash=[5,5]).encode(
+        x='x:Q',
+        y='y:Q'
     )
     
     chart1 = chart1 + line
@@ -159,15 +190,20 @@ def main():
         
         # Загрузка данных
         st.subheader("1. Загрузка данных")
-        uploaded_file = st.file_uploader("Загрузите Excel файл с данными", type=['xlsx'])
+        uploaded_file = st.file_uploader("Загрузите Excel файл с данными", type=['xlsx', 'xls'])
         
         if uploaded_file is not None:
             try:
-                df = pd.read_excel(uploaded_file)
+                # Пытаемся прочитать разными способами
+                try:
+                    df = pd.read_excel(uploaded_file)
+                except:
+                    df = pd.read_excel(uploaded_file, engine='openpyxl')
+                
                 required_columns = ['G', 'T', 't', 'd']
                 
                 if all(col in df.columns for col in required_columns):
-                    st.success("Данные успешно загружены!")
+                    st.success("✅ Данные успешно загружены!")
                     
                     # Показываем статистику
                     st.subheader("Статистика данных")
@@ -182,7 +218,7 @@ def main():
                         st.metric("Номера зерен", ", ".join(map(str, sorted(df['G'].unique()))))
                     
                     # Показываем данные
-                    with st.expander("Просмотр данных"):
+                    with st.expander("📋 Просмотр данных"):
                         st.dataframe(df)
                     
                     # Выбор данных для исключения
@@ -192,9 +228,9 @@ def main():
                     excluded_indices = []
                     
                     for idx, row in df.iterrows():
-                        col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2, 1])
+                        col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
                         with col1:
-                            st.write(f"Измерение {idx+1}")
+                            st.write(f"**{idx+1}**")
                         with col2:
                             st.write(f"G={row['G']}")
                         with col3:
@@ -205,29 +241,37 @@ def main():
                             if st.checkbox("Исключить", key=f"exclude_{idx}"):
                                 excluded_indices.append(idx)
                     
+                    st.info(f"Исключено точек: {len(excluded_indices)}")
+                    
                     # Обучение модели
                     st.subheader("3. Обучение модели")
                     if len(df) - len(excluded_indices) >= 4:  # Минимум 4 точки для регрессии
                         try:
                             X, y, df_clean = prepare_data(df, excluded_indices)
                             model = SigmaPhaseModel()
-                            model.fit(X, y)
+                            result = model.fit(X, y)
+                            
+                            if result is None:
+                                st.error("Не удалось обучить модель. Проверьте данные.")
+                                return
                             
                             # Предсказания
-                            y_pred = model.intercept_ + X @ model.coef_
+                            y_pred = model.predict_ln_d(X)
                             df_clean['d_pred'] = np.exp(y_pred)
                             
                             # Показываем коэффициенты модели
                             st.subheader("Коэффициенты модели")
                             st.latex(r"ln(d) = \beta_0 + \beta_1 \cdot ln(t) + \beta_2 \cdot \frac{1}{T} + \beta_3 \cdot ln\left(\frac{1}{\sqrt{a_v}}\right)")
                             
-                            col1, col2 = st.columns(2)
+                            col1, col2, col3 = st.columns(3)
                             with col1:
-                                st.write(f"β₀ (intercept) = {model.intercept_:.6f}")
-                                st.write(f"β₁ (ln(t)) = {model.coef_[0]:.6f}")
+                                st.metric("β₀ (intercept)", f"{model.intercept_:.6f}")
+                                st.metric("β₁ (ln(t))", f"{model.coef_[0]:.6f}")
                             with col2:
-                                st.write(f"β₂ (1/T) = {model.coef_[1]:.6f}")
-                                st.write(f"β₃ (ln(1/√a_v)) = {model.coef_[2]:.6f}")
+                                st.metric("β₂ (1/T)", f"{model.coef_[1]:.6f}")
+                                st.metric("β₃ (ln(1/√a_v))", f"{model.coef_[2]:.6f}")
+                            with col3:
+                                st.metric("Энергия активации Q", f"{-2 * 8.314 * model.coef_[1]:.1f} Дж/моль")
                             
                             # Метрики качества
                             st.subheader("Метрики качества модели")
@@ -239,7 +283,7 @@ def main():
                             with col3:
                                 st.metric("MAE", f"{model.mae:.4f}")
                             with col4:
-                                st.metric("Количество точек", f"{len(df_clean)}")
+                                st.metric("Точек обучения", f"{len(df_clean)}")
                             
                             # Графики валидации
                             st.subheader("4. Валидация модели")
@@ -283,48 +327,57 @@ def main():
                             st.session_state['model_coef'] = model.coef_
                             st.session_state['model_intercept'] = model.intercept_
                             
-                            # Кнопка для экспорта модели
-                            st.subheader("5. Экспорт модели")
-                            model_params = {
-                                'intercept': model.intercept_,
-                                'coef_ln_t': model.coef_[0],
-                                'coef_inv_T': model.coef_[1],
-                                'coef_ln_inv_sqrt_a_v': model.coef_[2]
-                            }
-                            
-                            st.write("Параметры модели для использования в других программах:")
+                            # Экспорт параметров модели
+                            st.subheader("5. Параметры модели для использования")
                             st.code(f"""
-                            Модель: ln(d) = β₀ + β₁·ln(t) + β₂·(1/T) + β₃·ln(1/√a_v)
-                            
-                            β₀ = {model.intercept_:.8f}
-                            β₁ = {model.coef_[0]:.8f}
-                            β₂ = {model.coef_[1]:.8f}
-                            β₃ = {model.coef_[2]:.8f}
-                            
-                            Формула для расчета температуры:
-                            T = β₂ / [ln(d) - β₀ - β₁·ln(t) - β₃·ln(1/√a_v)] - 273.15
+МОДЕЛЬ РОСТА СИГМА-ФАЗЫ
+Уравнение: ln(d) = β₀ + β₁·ln(t) + β₂·(1/T) + β₃·ln(1/√a_v)
+
+ПАРАМЕТРЫ:
+β₀ = {model.intercept_:.8f}
+β₁ = {model.coef_[0]:.8f}  
+β₂ = {model.coef_[1]:.8f}
+β₃ = {model.coef_[2]:.8f}
+
+ФОРМУЛА ДЛЯ РАСЧЕТА ТЕМПЕРАТУРЫ:
+T [°C] = β₂ / [ln(d) - β₀ - β₁·ln(t) - β₃·ln(1/√a_v)] - 273.15
+
+Энергия активации: {-2 * 8.314 * model.coef_[1]:.1f} Дж/моль
+Качество модели: R² = {model.r2:.4f}
                             """)
                             
                         except Exception as e:
                             st.error(f"Ошибка при обучении модели: {str(e)}")
                     else:
-                        st.warning("Недостаточно данных для обучения модели. Нужно минимум 4 измерения.")
+                        st.warning("⚠️ Недостаточно данных для обучения модели. Нужно минимум 4 измерения.")
                         
                 else:
-                    st.error(f"В файле должны быть столбцы: {required_columns}")
+                    missing_cols = [col for col in required_columns if col not in df.columns]
+                    st.error(f"❌ В файле отсутствуют столбцы: {missing_cols}")
                     
             except Exception as e:
-                st.error(f"Ошибка при чтении файла: {str(e)}")
+                st.error(f"❌ Ошибка при чтении файла: {str(e)}")
         else:
-            st.info("Загрузите Excel файл с колонками: G, T, t, d")
+            st.info("📁 Загрузите Excel файл с колонками: G, T, t, d")
+            
+            # Пример данных
+            with st.expander("📋 Пример формата данных"):
+                example_data = pd.DataFrame({
+                    'G': [3, 5, 8, 9],
+                    'T': [600, 650, 700, 600],
+                    't': [2000, 4000, 6000, 8000],
+                    'd': [5.2, 8.7, 12.3, 6.8]
+                })
+                st.dataframe(example_data)
+                st.write("**G** - номер зерна, **T** - температура (°C), **t** - время (ч), **d** - диаметр (мкм²)")
     
     with tab2:
-        st.header("Калькулятор температуры эксплуатации")
+        st.header("🧮 Калькулятор температуры эксплуатации")
         
         if 'trained_model' in st.session_state:
             model = st.session_state['trained_model']
             
-            st.success("Модель готова к использованию!")
+            st.success("✅ Модель готова к использованию!")
             st.write("Введите параметры для расчета температуры:")
             
             col1, col2, col3 = st.columns(3)
@@ -332,47 +385,53 @@ def main():
             with col1:
                 grain_number = st.selectbox("Номер зерна (G)", options=grain_df['G'].tolist())
             with col2:
-                time_hours = st.number_input("Время эксплуатации (ч)", min_value=1, value=5000)
+                time_hours = st.number_input("Время эксплуатации (ч)", min_value=1, value=5000, step=100)
             with col3:
                 d_sigma = st.number_input("Эквивалентный диаметр сигма-фазы (мкм²)", 
                                         min_value=0.1, value=10.0, step=0.1)
             
-            if st.button("Рассчитать температуру"):
+            if st.button("🎯 Рассчитать температуру", type="primary"):
                 try:
                     temperature = model.predict_temperature(d_sigma, time_hours, grain_number)
                     
                     # Проверка диапазона работоспособности
                     if temperature < 550:
-                        st.error(f"⚠️ Рассчитанная температура: {temperature:.1f} °C\n\n"
-                                "**Внимание:** Температура ниже 550°C - сигма-фаза не выделяется")
+                        st.error(f"""
+                        ⚠️ **Рассчитанная температура: {temperature:.1f} °C**
+                        
+                        **Внимание:** Температура ниже 550°C - сигма-фаза практически не выделяется
+                        """)
                     elif temperature > 900:
-                        st.error(f"⚠️ Рассчитанная температура: {temperature:.1f} °C\n\n"
-                                "**Внимание:** Температура выше 900°C - сигма-фаза не выделяется")
+                        st.error(f"""
+                        ⚠️ **Рассчитанная температура: {temperature:.1f} °C**
+                        
+                        **Внимание:** Температура выше 900°C - сигма-фаза не выделяется
+                        """)
                     elif 590 <= temperature <= 630:
-                        st.success(f"✅ Оптимальный диапазон: {temperature:.1f} °C\n\n"
-                                 "**Модель работает с максимальной точностью**")
+                        st.success(f"""
+                        ✅ **Оптимальный диапазон: {temperature:.1f} °C**
+                        
+                        **Модель работает с максимальной точностью**
+                        """)
                     else:
-                        st.warning(f"📊 Рассчитанная температура: {temperature:.1f} °C\n\n"
-                                 "**Внимание:** Температура вне оптимального диапазона 590-630°C")
+                        st.warning(f"""
+                        📊 **Рассчитанная температура: {temperature:.1f} °C**
+                        
+                        **Внимание:** Температура вне оптимального диапазона 590-630°C
+                        """)
                     
                     # Дополнительная информация
-                    with st.expander("Детали расчета"):
+                    with st.expander("🔍 Детали расчета"):
                         grain_info = grain_df[grain_df['G'] == grain_number].iloc[0]
                         st.write(f"**Параметры зерна №{grain_number}:**")
-                        st.write(f"- Средняя площадь сечения: {grain_info['a_v']} мм²")
-                        st.write(f"- Средний диаметр: {grain_info['d_av']} мм")
+                        st.write(f"- Средняя площадь сечения: {grain_info['a_v']:.6f} мм²")
+                        st.write(f"- Средний диаметр: {grain_info['d_av']:.3f} мм")
                         st.write(f"- ln(1/√a_v) = {grain_info['ln_inv_sqrt_a_v']:.4f}")
                         
-                        st.write("**Использованные параметры модели:**")
-                        st.write(f"- β₀ = {model.intercept_:.6f}")
-                        st.write(f"- β₁ = {model.coef_[0]:.6f}")
-                        st.write(f"- β₂ = {model.coef_[1]:.6f}")
-                        st.write(f"- β₃ = {model.coef_[2]:.6f}")
-                        
                 except Exception as e:
-                    st.error(f"Ошибка при расчете: {str(e)}")
+                    st.error(f"❌ Ошибка при расчете: {str(e)}")
         else:
-            st.warning("Сначала обучите модель во вкладке 'Анализ данных'")
+            st.warning("📊 Сначала обучите модель во вкладке 'Анализ данных'")
 
 if __name__ == "__main__":
     main()
