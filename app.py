@@ -1,11 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import altair as alt
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-from scipy import stats
 import io
 import warnings
 warnings.filterwarnings('ignore')
@@ -88,6 +86,67 @@ def prepare_data(df, excluded_indices=[]):
     
     return X, y, df_clean
 
+def create_validation_charts(df_clean, y, y_pred):
+    """Создание графиков валидации с использованием Altair"""
+    
+    # Данные для графиков
+    plot_data = pd.DataFrame({
+        'actual': np.exp(y),
+        'predicted': np.exp(y_pred),
+        'residuals': np.exp(y) - np.exp(y_pred),
+        'temperature': df_clean['T'],
+        'grain_size': df_clean['G']
+    })
+    
+    # График 1: Предсказанные vs Фактические значения
+    chart1 = alt.Chart(plot_data).mark_circle(size=60).encode(
+        x=alt.X('actual:Q', title='Фактический диаметр (мкм²)'),
+        y=alt.Y('predicted:Q', title='Предсказанный диаметр (мкм²)'),
+        color='temperature:Q',
+        tooltip=['actual', 'predicted', 'temperature', 'grain_size']
+    ).properties(
+        width=400,
+        height=300,
+        title='Предсказанные vs Фактические значения'
+    )
+    
+    line = alt.Chart(pd.DataFrame({
+        'actual': [plot_data['actual'].min(), plot_data['actual'].max()],
+        'predicted': [plot_data['actual'].min(), plot_data['actual'].max()]
+    })).mark_line(color='red', strokeDash=[5,5]).encode(
+        x='actual:Q',
+        y='predicted:Q'
+    )
+    
+    chart1 = chart1 + line
+    
+    # График 2: Остатки
+    chart2 = alt.Chart(plot_data).mark_circle(size=60).encode(
+        x=alt.X('predicted:Q', title='Предсказанный диаметр (мкм²)'),
+        y=alt.Y('residuals:Q', title='Остатки'),
+        color='temperature:Q',
+        tooltip=['predicted', 'residuals', 'temperature']
+    ).properties(
+        width=400,
+        height=300,
+        title='Остатки модели'
+    )
+    
+    zero_line = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y:Q')
+    chart2 = chart2 + zero_line
+    
+    # График 3: Распределение ошибок
+    chart3 = alt.Chart(plot_data).mark_bar().encode(
+        x=alt.X('residuals:Q', bin=alt.Bin(maxbins=15), title='Ошибка предсказания'),
+        y=alt.Y('count()', title='Частота')
+    ).properties(
+        width=400,
+        height=300,
+        title='Распределение ошибок'
+    )
+    
+    return chart1, chart2, chart3
+
 def main():
     st.set_page_config(page_title="Sigma Phase Analyzer", layout="wide")
     st.title("🔬 Анализатор сигма-фазы в стали 12Х18Н12Т")
@@ -109,8 +168,6 @@ def main():
                 
                 if all(col in df.columns for col in required_columns):
                     st.success("Данные успешно загружены!")
-                    st.write("Предпросмотр данных:")
-                    st.dataframe(df.head())
                     
                     # Показываем статистику
                     st.subheader("Статистика данных")
@@ -124,18 +181,28 @@ def main():
                     with col4:
                         st.metric("Номера зерен", ", ".join(map(str, sorted(df['G'].unique()))))
                     
+                    # Показываем данные
+                    with st.expander("Просмотр данных"):
+                        st.dataframe(df)
+                    
                     # Выбор данных для исключения
                     st.subheader("2. Выбор данных для исключения")
                     st.write("Исключите выбросы для улучшения модели:")
                     
                     excluded_indices = []
-                    cols = st.columns(3)
                     
                     for idx, row in df.iterrows():
-                        col_idx = idx % 3
-                        with cols[col_idx]:
-                            if st.checkbox(f"Исключить: G={row['G']}, T={row['T']}°C, t={row['t']}ч", 
-                                         key=f"exclude_{idx}"):
+                        col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2, 1])
+                        with col1:
+                            st.write(f"Измерение {idx+1}")
+                        with col2:
+                            st.write(f"G={row['G']}")
+                        with col3:
+                            st.write(f"T={row['T']}°C")
+                        with col4:
+                            st.write(f"t={row['t']}ч")
+                        with col5:
+                            if st.checkbox("Исключить", key=f"exclude_{idx}"):
                                 excluded_indices.append(idx)
                     
                     # Обучение модели
@@ -149,10 +216,6 @@ def main():
                             # Предсказания
                             y_pred = model.intercept_ + X @ model.coef_
                             df_clean['d_pred'] = np.exp(y_pred)
-                            df_clean['T_pred'] = np.exp(model.intercept_ + 
-                                                       model.coef_[0] * df_clean['ln_t'] + 
-                                                       model.coef_[2] * df_clean['ln_inv_sqrt_a_v']) / \
-                                               (model.coef_[1] * df_clean['inv_T'])
                             
                             # Показываем коэффициенты модели
                             st.subheader("Коэффициенты модели")
@@ -168,73 +231,82 @@ def main():
                             
                             # Метрики качества
                             st.subheader("Метрики качества модели")
-                            col1, col2, col3 = st.columns(3)
+                            col1, col2, col3, col4 = st.columns(4)
                             with col1:
                                 st.metric("R²", f"{model.r2:.4f}")
                             with col2:
                                 st.metric("RMSE", f"{model.rmse:.4f}")
                             with col3:
                                 st.metric("MAE", f"{model.mae:.4f}")
+                            with col4:
+                                st.metric("Количество точек", f"{len(df_clean)}")
                             
                             # Графики валидации
                             st.subheader("4. Валидация модели")
+                            chart1, chart2, chart3 = create_validation_charts(df_clean, y, y_pred)
                             
-                            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
-                            
-                            # График 1: Предсказанные vs Фактические значения
-                            ax1.scatter(np.exp(y), np.exp(y_pred), alpha=0.7)
-                            ax1.plot([np.exp(y).min(), np.exp(y).max()], 
-                                    [np.exp(y).min(), np.exp(y).max()], 'r--', alpha=0.8)
-                            ax1.set_xlabel('Фактический диаметр (мкм²)')
-                            ax1.set_ylabel('Предсказанный диаметр (мкм²)')
-                            ax1.set_title('Предсказанные vs Фактические значения')
-                            ax1.grid(True, alpha=0.3)
-                            
-                            # График 2: Остатки
-                            residuals = np.exp(y) - np.exp(y_pred)
-                            ax2.scatter(np.exp(y_pred), residuals, alpha=0.7)
-                            ax2.axhline(y=0, color='r', linestyle='--', alpha=0.8)
-                            ax2.set_xlabel('Предсказанный диаметр (мкм²)')
-                            ax2.set_ylabel('Остатки')
-                            ax2.set_title('Остатки модели')
-                            ax2.grid(True, alpha=0.3)
-                            
-                            # График 3: Распределение ошибок
-                            ax3.hist(residuals, bins=15, alpha=0.7, edgecolor='black')
-                            ax3.set_xlabel('Ошибка предсказания')
-                            ax3.set_ylabel('Частота')
-                            ax3.set_title('Распределение ошибок')
-                            ax3.grid(True, alpha=0.3)
-                            
-                            # График 4: Зависимость по температурам
-                            temperatures = df_clean['T'].unique()
-                            mean_errors = []
-                            for temp in temperatures:
-                                temp_mask = df_clean['T'] == temp
-                                mean_errors.append(residuals[temp_mask].mean())
-                            
-                            ax4.bar(temperatures, mean_errors, alpha=0.7)
-                            ax4.set_xlabel('Температура (°C)')
-                            ax4.set_ylabel('Средняя ошибка')
-                            ax4.set_title('Ошибка предсказания по температурам')
-                            ax4.grid(True, alpha=0.3)
-                            
-                            plt.tight_layout()
-                            st.pyplot(fig)
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.altair_chart(chart1, use_container_width=True)
+                                st.altair_chart(chart3, use_container_width=True)
+                            with col2:
+                                st.altair_chart(chart2, use_container_width=True)
+                                
+                                # График ошибок по температурам
+                                error_by_temp = df_clean.groupby('T').apply(
+                                    lambda x: (x['d'] - x['d_pred']).mean()
+                                ).reset_index()
+                                error_by_temp.columns = ['T', 'mean_error']
+                                
+                                chart4 = alt.Chart(error_by_temp).mark_bar().encode(
+                                    x=alt.X('T:Q', title='Температура (°C)'),
+                                    y=alt.Y('mean_error:Q', title='Средняя ошибка'),
+                                    tooltip=['T', 'mean_error']
+                                ).properties(
+                                    height=300,
+                                    title='Средняя ошибка по температурам'
+                                )
+                                st.altair_chart(chart4, use_container_width=True)
                             
                             # Таблица с сравнением
                             st.subheader("Сравнение экспериментальных и расчетных значений")
                             comparison_df = df_clean[['G', 'T', 't', 'd', 'd_pred']].copy()
                             comparison_df['Ошибка, %'] = 100 * (comparison_df['d_pred'] - comparison_df['d']) / comparison_df['d']
-                            st.dataframe(comparison_df.round(4))
+                            comparison_df['d'] = comparison_df['d'].round(4)
+                            comparison_df['d_pred'] = comparison_df['d_pred'].round(4)
+                            comparison_df['Ошибка, %'] = comparison_df['Ошибка, %'].round(2)
+                            
+                            st.dataframe(comparison_df)
                             
                             # Сохранение модели в сессии
                             st.session_state['trained_model'] = model
                             st.session_state['model_coef'] = model.coef_
                             st.session_state['model_intercept'] = model.intercept_
                             
+                            # Кнопка для экспорта модели
+                            st.subheader("5. Экспорт модели")
+                            model_params = {
+                                'intercept': model.intercept_,
+                                'coef_ln_t': model.coef_[0],
+                                'coef_inv_T': model.coef_[1],
+                                'coef_ln_inv_sqrt_a_v': model.coef_[2]
+                            }
+                            
+                            st.write("Параметры модели для использования в других программах:")
+                            st.code(f"""
+                            Модель: ln(d) = β₀ + β₁·ln(t) + β₂·(1/T) + β₃·ln(1/√a_v)
+                            
+                            β₀ = {model.intercept_:.8f}
+                            β₁ = {model.coef_[0]:.8f}
+                            β₂ = {model.coef_[1]:.8f}
+                            β₃ = {model.coef_[2]:.8f}
+                            
+                            Формула для расчета температуры:
+                            T = β₂ / [ln(d) - β₀ - β₁·ln(t) - β₃·ln(1/√a_v)] - 273.15
+                            """)
+                            
                         except Exception as e:
-                            st.error(f"Ошибка при обучении модели: {e}")
+                            st.error(f"Ошибка при обучении модели: {str(e)}")
                     else:
                         st.warning("Недостаточно данных для обучения модели. Нужно минимум 4 измерения.")
                         
@@ -242,7 +314,7 @@ def main():
                     st.error(f"В файле должны быть столбцы: {required_columns}")
                     
             except Exception as e:
-                st.error(f"Ошибка при чтении файла: {e}")
+                st.error(f"Ошибка при чтении файла: {str(e)}")
         else:
             st.info("Загрузите Excel файл с колонками: G, T, t, d")
     
@@ -271,28 +343,34 @@ def main():
                     
                     # Проверка диапазона работоспособности
                     if temperature < 550:
-                        st.error(f"⚠️ Рассчитанная температура: {temperature:.1f} °C\n"
-                                "Температура ниже 550°C - сигма-фаза не выделяется")
+                        st.error(f"⚠️ Рассчитанная температура: {temperature:.1f} °C\n\n"
+                                "**Внимание:** Температура ниже 550°C - сигма-фаза не выделяется")
                     elif temperature > 900:
-                        st.error(f"⚠️ Рассчитанная температура: {temperature:.1f} °C\n"
-                                "Температура выше 900°C - сигма-фаза не выделяется")
+                        st.error(f"⚠️ Рассчитанная температура: {temperature:.1f} °C\n\n"
+                                "**Внимание:** Температура выше 900°C - сигма-фаза не выделяется")
                     elif 590 <= temperature <= 630:
-                        st.success(f"✅ Оптимальный диапазон: {temperature:.1f} °C\n"
-                                 "Модель работает с максимальной точностью")
+                        st.success(f"✅ Оптимальный диапазон: {temperature:.1f} °C\n\n"
+                                 "**Модель работает с максимальной точностью**")
                     else:
-                        st.warning(f"📊 Рассчитанная температура: {temperature:.1f} °C\n"
-                                 "Внимание: температура вне оптимального диапазона 590-630°C")
+                        st.warning(f"📊 Рассчитанная температура: {temperature:.1f} °C\n\n"
+                                 "**Внимание:** Температура вне оптимального диапазона 590-630°C")
                     
                     # Дополнительная информация
                     with st.expander("Детали расчета"):
                         grain_info = grain_df[grain_df['G'] == grain_number].iloc[0]
-                        st.write(f"Параметры зерна №{grain_number}:")
+                        st.write(f"**Параметры зерна №{grain_number}:**")
                         st.write(f"- Средняя площадь сечения: {grain_info['a_v']} мм²")
                         st.write(f"- Средний диаметр: {grain_info['d_av']} мм")
                         st.write(f"- ln(1/√a_v) = {grain_info['ln_inv_sqrt_a_v']:.4f}")
                         
+                        st.write("**Использованные параметры модели:**")
+                        st.write(f"- β₀ = {model.intercept_:.6f}")
+                        st.write(f"- β₁ = {model.coef_[0]:.6f}")
+                        st.write(f"- β₂ = {model.coef_[1]:.6f}")
+                        st.write(f"- β₃ = {model.coef_[2]:.6f}")
+                        
                 except Exception as e:
-                    st.error(f"Ошибка при расчете: {e}")
+                    st.error(f"Ошибка при расчете: {str(e)}")
         else:
             st.warning("Сначала обучите модель во вкладке 'Анализ данных'")
 
